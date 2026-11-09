@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+# Spotify Web API + LRCLIB helper for the music app (shell.qml). Prints one JSON value per call.
+#   spot search QUERY | play URI [CONTEXT_URIS...] | status | toggle | next | prev | seek MS | volume PCT | queue | genre ARTIST | ensure | idle | quit | login
+#   spot lyrics URI ARTIST TITLE ALBUM SECONDS | test
+import base64, hashlib, http.server, json, os, re, secrets, shutil, socket, subprocess, sys, time
+import urllib.error, urllib.parse as up, urllib.request as ur
+
+CLIENT_ID_FILE = os.path.expanduser("~/.config/music-app/client_id")
+REDIRECT = "http://127.0.0.1:8989/login"
+SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+CACHE = os.path.expanduser("~/.cache/music-app")
+TOKEN = CACHE + "/token.json"
+DEVICE = socket.gethostname()   # the official Spotify app registers as the hostname
+API = "https://api.spotify.com/v1"
+
+
+def http(req):
+    with ur.urlopen(req, timeout=10) as r:
+        body = r.read()
+    try:
+        return json.loads(body)
+    except ValueError:  # playback commands answer with an empty or non-JSON body
+        return None
+
+
+def client_id():
+    try:
+        with open(CLIENT_ID_FILE) as f:
+            return f.read().strip()
+    except OSError:
+        raise SystemExit(json.dumps({"error": "No Spotify Client ID. See the README, then run: spot login"}))
+
+
+def save_token(t):
+    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    fd = os.open(TOKEN + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(t, f)
+    os.replace(TOKEN + ".tmp", TOKEN)
+
+
+def pkce(verifier):
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+
+def login():
+    verifier = secrets.token_urlsafe(64)
+    state = secrets.token_urlsafe(16)
+    print("Open this link and click Agree:\n\nhttps://accounts.spotify.com/authorize?" + up.urlencode({
+        "response_type": "code", "client_id": client_id(), "redirect_uri": REDIRECT, "scope": SCOPES,
+        "code_challenge_method": "S256", "code_challenge": pkce(verifier), "state": state}) + "\n", flush=True)
+    got = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            url = up.urlparse(self.path)
+            q = up.parse_qs(url.query)
+            ok = url.path == "/login" and q.get("state") == [state] and "code" in q
+            if ok:
+                got["code"] = q["code"][0]
+            self.send_response(200 if ok else 400)
+            self.end_headers()
+            self.wfile.write(b"Logged in, you can close this tab." if ok else b"Login failed, run spot login again.")
+
+        def log_message(self, *args):
+            pass
+
+    with http.server.HTTPServer(("127.0.0.1", 8989), Handler) as server:
+        while "code" not in got:
+            server.handle_request()
+    data = up.urlencode({"grant_type": "authorization_code", "code": got["code"], "redirect_uri": REDIRECT,
+                         "client_id": client_id(), "code_verifier": verifier}).encode()
+    new = http(ur.Request("https://accounts.spotify.com/api/token", data=data))
+    save_token({"access_token": new["access_token"], "refresh_token": new["refresh_token"],
+                "expires_at": time.time() + new["expires_in"]})
+    print("Logged in.")
+
+
+def token():
+    try:
+        with open(TOKEN) as f:
+            t = json.load(f)
+    except OSError:
+        raise SystemExit(json.dumps({"error": "Not logged in. Run: spot login"}))
+    if t["expires_at"] - 60 > time.time():
+        return t["access_token"]
+    data = up.urlencode({"grant_type": "refresh_token", "refresh_token": t["refresh_token"], "client_id": client_id()}).encode()
+    new = http(ur.Request("https://accounts.spotify.com/api/token", data=data))
+    t.update(access_token=new["access_token"], refresh_token=new.get("refresh_token", t["refresh_token"]),
+             expires_at=time.time() + new["expires_in"])
+    save_token(t)
+    return t["access_token"]
+
+
+def api(method, path, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    if method == "PUT" and data is None:
+        data = b""
+    if method == "POST" and data is None:
+        data = b""
+    return http(ur.Request(API + path, data=data, method=method, headers={
+        "Authorization": "Bearer " + token(), "Content-Type": "application/json"}))
+
+
+def device_id():
+    for d in api("GET", "/me/player/devices")["devices"]:
+        if d["name"] == DEVICE:
+            return d["id"]
+    raise SystemExit(json.dumps({"error": "Spotify app is not running"}))
+
+
+BUS = ["busctl", "--user"], ["org.mpris.MediaPlayer2.spotify", "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player"]
+
+
+def player_status():
+    r = subprocess.run(BUS[0] + ["get-property"] + BUS[1] + ["PlaybackStatus"], capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def mpris(method, *args):
+    for _ in range(40):     # Spotify may still be starting (it only runs on demand)
+        if player_status():
+            break
+        time.sleep(0.5)
+    r = subprocess.run(BUS[0] + ["call"] + BUS[1] + [method, *args], capture_output=True, text=True)
+    if r.returncode:
+        raise SystemExit(json.dumps({"error": "Spotify app is not running"}))
+
+
+def track(t):
+    imgs = t["album"]["images"]
+    return {"uri": t["uri"], "name": t["name"], "artist": ", ".join(a["name"] for a in t["artists"]),
+            "album": t["album"]["name"], "ms": t["duration_ms"],
+            "art": imgs[0]["url"] if imgs else "", "thumb": imgs[-1]["url"] if imgs else ""}
+
+
+def parse_lrc(text):
+    out = []
+    for line in text.splitlines():
+        stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", line)
+        words = re.sub(r"\[[^\]]*\]", "", line).strip()
+        out += [{"t": int((int(m) * 60 + float(s)) * 1000), "l": words} for m, s in stamps]
+    return sorted(out, key=lambda x: x["t"])
+
+
+def lyrics(artist, title, album, secs):
+    ua = {"User-Agent": "quickshell-music-app"}
+    q = up.urlencode({"artist_name": artist.split(",")[0], "track_name": title, "album_name": album, "duration": secs})
+    try:
+        hit = http(ur.Request("https://lrclib.net/api/get?" + q, headers=ua))
+    except urllib.error.HTTPError:  # no exact match: take the closest-length search result, synced preferred
+        q = up.urlencode({"artist_name": artist.split(",")[0], "track_name": title})
+        hits = http(ur.Request("https://lrclib.net/api/search?" + q, headers=ua))
+        hits = [h for h in hits if abs((h.get("duration") or 0) - int(secs)) < 8] or hits
+        hits.sort(key=lambda h: not h.get("syncedLyrics"))
+        hit = hits[0] if hits else {}
+    if hit.get("syncedLyrics"):
+        return {"synced": True, "lines": parse_lrc(hit["syncedLyrics"])}
+    return {"synced": False, "lines": [{"t": 0, "l": l} for l in (hit.get("plainLyrics") or "").splitlines()]}
+
+
+GENRE_RULES = [(4, ("metal",)), (5, ("electro", "house", "techno", "edm", "dance", "trance", "synth", "disco", "dubstep")),
+               (6, ("jazz", "blues")), (7, ("classical", "ambient", "orchestra")),
+               (1, ("hip hop", "hip-hop", "rap", "trap")), (2, ("r&b", "rnb", "soul", "funk")),
+               (3, ("rock", "punk", "grunge", "indie", "alternative", "emo")), (0, ("pop", "opm"))]
+DEFAULT_GENRE = 1   # order matches GENRES in shell.qml
+
+
+def classify(tags):
+    for tag in sorted(tags, key=lambda t: -t.get("count", 0)):
+        name = tag["name"].lower()
+        for idx, words in GENRE_RULES:
+            if any(w in name for w in words):
+                return idx
+    return DEFAULT_GENRE
+
+
+def genre(artist):  # Spotify gives no genres here, so use MusicBrainz's artist tags (cached per artist)
+    path = CACHE + "/genres.json"
+    try:
+        with open(path) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if artist in cache:
+        return cache[artist]
+    q = up.urlencode({"query": 'artist:"%s"' % artist.replace('"', ""), "fmt": "json", "limit": 1})
+    try:
+        hits = http(ur.Request("https://musicbrainz.org/ws/2/artist?" + q,
+                               headers={"User-Agent": "quickshell-music-app/1.0"}))["artists"]
+    except (urllib.error.URLError, OSError, TypeError, KeyError):
+        return DEFAULT_GENRE    # not cached: try again next time
+    cache[artist] = classify(hits[0].get("tags", [])) if hits else DEFAULT_GENRE
+    with open(path, "w") as f:
+        json.dump(cache, f)
+    return cache[artist]
+
+
+def main(cmd, a):
+    if cmd == "search":
+        q = up.urlencode({"q": a[0], "type": "track", "limit": 10})
+        return {"q": a[0], "items": [track(t) for t in api("GET", "/search?" + q)["tracks"]["items"]]}
+    if cmd == "status":
+        s = api("GET", "/me/player")
+        if not s or not s.get("item"):
+            return {}
+        return dict(track(s["item"]), playing=s["is_playing"], pos=s.get("progress_ms") or 0,
+                    volume=s["device"].get("volume_percent"), device=s["device"]["name"])
+    if cmd == "ensure":     # start the hidden Spotify app if it isn't up
+        if not player_status() and not subprocess.run(["pgrep", "-x", "spotify"], capture_output=True).returncode == 0:
+            subprocess.Popen(["hyprctl", "dispatch", 'hl.dsp.exec_cmd("%sspotify-launcher", { workspace = "special:music silent" })' % ("uwsm app -- " if shutil.which("uwsm") else "")],
+                             stdout=subprocess.DEVNULL)
+        return {"ok": True}
+    if cmd == "idle":
+        st = player_status()
+        return {"running": st is not None, "playing": bool(st and "Playing" in st)}
+    if cmd == "quit":
+        subprocess.run(["pkill", "-x", "spotify"])
+        return {"ok": True}
+    if cmd == "queue":
+        return {"items": [track(t) for t in (api("GET", "/me/player/queue") or {}).get("queue", []) if t.get("album")][:3]}
+    if cmd == "genre":
+        return {"artist": a[0], "genre": genre(a[0])}
+    if cmd == "lyrics":
+        return dict(lyrics(*a[1:]), uri=a[0])
+    # Spotify's web "play" wipes the desktop app's state, so transport goes through the app's own MPRIS.
+    if cmd == "play":
+        mpris("OpenUri", "s", a[0])
+    elif cmd in ("toggle", "next", "prev"):
+        mpris({"toggle": "PlayPause", "next": "Next", "prev": "Previous"}[cmd])
+    elif cmd == "seek":
+        api("PUT", "/me/player/seek?position_ms=%d&device_id=%s" % (int(a[0]), device_id()))
+    elif cmd == "volume":
+        api("PUT", "/me/player/volume?volume_percent=%d&device_id=%s" % (int(a[0]), device_id()))
+    else:
+        raise SystemExit(json.dumps({"error": "unknown command " + cmd}))
+    return {"ok": True}
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "test":
+        got = parse_lrc("[00:01.50] a\n[01:00.00][00:03.00] b\n[ar:x]\n")
+        assert [(l["t"], l["l"]) for l in got] == [(1500, "a"), (3000, "b"), (60000, "b")], got
+        assert classify([{"name": "pop", "count": 1}, {"name": "heavy metal", "count": 5}]) == 4
+        assert classify([{"name": "french house", "count": 3}]) == 5
+        assert classify([]) == DEFAULT_GENRE
+        assert pkce("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        print("ok")
+    elif sys.argv[1] == "login":
+        login()
+    else:
+        try:
+            print(json.dumps(main(sys.argv[1], sys.argv[2:])))
+        except urllib.error.HTTPError as e:
+            print(json.dumps({"error": "%d %s" % (e.code, e.read().decode(errors="replace")[:200])}))
+            sys.exit(1)
+        except (urllib.error.URLError, OSError) as e:
+            print(json.dumps({"error": str(e)}))
+            sys.exit(1)
