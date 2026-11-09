@@ -103,8 +103,12 @@ def api(method, path, body=None):
 
 
 def device_id():
-    for d in api("GET", "/me/player/devices")["devices"]:
+    devices = api("GET", "/me/player/devices")["devices"]
+    for d in devices:
         if d["name"] == DEVICE:
+            return d["id"]
+    for d in sorted(devices, key=lambda d: not d.get("is_active")):   # some builds don't register as the hostname
+        if d.get("type") == "Computer":
             return d["id"]
     raise SystemExit(json.dumps({"error": "Spotify app is not running"}))
 
@@ -125,6 +129,55 @@ def mpris(method, *args):
     r = subprocess.run(BUS[0] + ["call"] + BUS[1] + [method, *args], capture_output=True, text=True)
     if r.returncode:
         raise SystemExit(json.dumps({"error": "Spotify app is not running"}))
+
+
+def spotify_running():
+    return subprocess.run(["pgrep", "-x", "spotify"], capture_output=True).returncode == 0
+
+
+def spotify_cmd():     # spotify-launcher on Arch; plain spotify for the snap, Flatpak alias or RPM
+    return "spotify-launcher" if shutil.which("spotify-launcher") else "spotify"
+
+
+def start_hidden_spotify():
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
+        subprocess.Popen(["hyprctl", "dispatch", 'hl.dsp.exec_cmd("%s%s", { workspace = "special:music silent" })'
+                          % ("uwsm app -- " if shutil.which("uwsm") else "", spotify_cmd())], stdout=subprocess.DEVNULL)
+        return
+    if "KDE" in os.environ.get("XDG_CURRENT_DESKTOP", "").upper():
+        kwin_hide_spotify()
+    subprocess.Popen([spotify_cmd()], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+# KDE Plasma has no hidden workspace, so a short-lived KWin script minimizes the Spotify window and keeps
+# it out of the taskbar and Alt+Tab. It is unloaded after a minute, so a Spotify opened by hand stays normal.
+KWIN_NAME = "music-app-hide-spotify"
+KWIN_JS = """
+function hide(w) {
+    if (!w || String(w.resourceClass).toLowerCase() !== "spotify") return;
+    w.minimized = true; w.skipTaskbar = true; w.skipSwitcher = true; w.skipPager = true;
+}
+workspace.windowAdded.connect(hide);
+workspace.windowList().forEach(hide);
+"""
+
+
+def kwin(*args):
+    return subprocess.run(["busctl", "--user", "call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", *args],
+                          capture_output=True, text=True)
+
+
+def kwin_hide_spotify():
+    path = CACHE + "/hide-spotify.js"
+    os.makedirs(CACHE, mode=0o700, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(KWIN_JS)
+    kwin("unloadScript", "s", KWIN_NAME)
+    if kwin("loadScript", "ss", path, KWIN_NAME).returncode == 0:
+        kwin("start")
+        subprocess.Popen(["sh", "-c", "sleep 60; busctl --user call org.kde.KWin /Scripting org.kde.kwin.Scripting unloadScript s "
+                          + KWIN_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def track(t):
@@ -207,9 +260,8 @@ def main(cmd, a):
         return dict(track(s["item"]), playing=s["is_playing"], pos=s.get("progress_ms") or 0,
                     volume=s["device"].get("volume_percent"), device=s["device"]["name"])
     if cmd == "ensure":     # start the hidden Spotify app if it isn't up
-        if not player_status() and not subprocess.run(["pgrep", "-x", "spotify"], capture_output=True).returncode == 0:
-            subprocess.Popen(["hyprctl", "dispatch", 'hl.dsp.exec_cmd("%sspotify-launcher", { workspace = "special:music silent" })' % ("uwsm app -- " if shutil.which("uwsm") else "")],
-                             stdout=subprocess.DEVNULL)
+        if not player_status() and not spotify_running():
+            start_hidden_spotify()
         return {"ok": True}
     if cmd == "idle":
         st = player_status()

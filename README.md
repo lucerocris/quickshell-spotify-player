@@ -1,14 +1,15 @@
 # quickshell-spotify-player
 
-A full-screen Spotify player for Hyprland, built with Quickshell. It shows the album on a spinning record, a vertical audio visualizer, timed lyrics and your queue. The background colour follows the genre of the song.
+A full-screen Spotify player for Hyprland and KDE Plasma 6 (Wayland), built with Quickshell. It shows the album on a spinning record, a vertical audio visualizer, timed lyrics and your queue. The background colour follows the genre of the song.
 
 Search, playback and the queue use your Spotify account. The official Spotify app plays the audio, hidden on a special workspace. It starts when you first open the player and quits after 10 idle minutes.
 
 ## Requirements
 
 - Spotify Premium
-- Hyprland using its Lua config syntax (`hl.dsp...`)
-- `quickshell`, `cava`, `python3`, `spotify-launcher`, and Qt 6 SVG support
+- Hyprland using its Lua config syntax (`hl.dsp...`), or KDE Plasma 6 on Wayland
+- `quickshell`, `cava`, `python3`, and Qt 6 SVG support
+- The Spotify desktop app: `spotify-launcher`, or any `spotify` command (snap, Flatpak alias, RPM)
 
 ## Install
 
@@ -33,7 +34,7 @@ Search, playback and the queue use your Spotify account. The official Spotify ap
    ~/.config/quickshell/music/spot login
    ```
 
-5. Log in to the Spotify app once by running `spotify-launcher`.
+5. Log in to the Spotify app once by running `spotify-launcher` (or `spotify`).
 
 6. Add these to your Hyprland config:
 
@@ -41,6 +42,19 @@ Search, playback and the queue use your Spotify account. The official Spotify ap
    hl.exec_cmd("qs -c music -d")   -- in your autostart
    hl.bind("ALT + S", hl.dsp.exec_cmd("qs -c music ipc call music toggle"), { desc = "music player" })
    ```
+
+   On KDE Plasma, add an autostart entry and a shortcut instead:
+
+   ```sh
+   printf '[Desktop Entry]\nType=Application\nName=Quickshell Music Player\nExec=qs -c music -d\n' \
+     > ~/.config/autostart/quickshell-music.desktop
+   printf '[Desktop Entry]\nType=Application\nName=Toggle Music Player\nExec=qs -c music ipc call music toggle\nNoDisplay=true\nX-KDE-GlobalAccel-CommandShortcut=true\n' \
+     > ~/.local/share/applications/music-toggle.desktop
+   ```
+
+   Then bind "Toggle Music Player" to Alt+S in System Settings → Keyboard → Shortcuts → Add New → Application.
+
+   KDE has no hidden workspace, so the player loads a short-lived KWin script that minimizes the Spotify window and keeps it out of the taskbar and Alt+Tab. The script unloads after a minute, so a Spotify you open yourself behaves normally. The overlay opens on the first screen.
 
 ## Keys
 
